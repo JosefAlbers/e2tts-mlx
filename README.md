@@ -18,12 +18,35 @@ pip install e2tts-mlx
 
 ## Usage
 
+To use a pre-trained model for text-to-speech:
+
+```zsh
+e2tts 'We must achieve our own salvation.'
+```
+
+https://github.com/user-attachments/assets/c022d622-2437-4dbf-b3ac-d0ce89322402
+
+To train a new model with default settings:
+
 ```zsh
 e2tts
 ```
 
 ![e2tts](https://raw.githubusercontent.com/JosefAlbers/e2tts-mlx/main/assets/e2tts.png)
-[e2tts](https://github.com/user-attachments/assets/a9381eb8-6235-417c-b06c-a446fe14ae49)
+
+To train with custom options:
+
+```zsh
+e2tts --batch_size=16 --n_epoch=100 --lr=1e-4 --depth=8 --stp=32
+```
+
+Available training options:
+- `--batch_size`: Set the batch size (default: 32)
+- `--n_epoch`: Set the number of epochs (default: 200)
+- `--lr`: Set the learning rate (default: 2e-4)
+- `--depth`: Set the model depth (default: 8)
+- `--stp`: Set the number of steps for sampling (default: 1)
+- `--postfix`: Add a custom postfix to output file names
 
 ## Acknowledgements
 

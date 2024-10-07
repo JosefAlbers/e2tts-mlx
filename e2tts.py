@@ -15,6 +15,7 @@ from datasets import Audio, load_dataset
 from einops.array_api import pack, rearrange, repeat, unpack
 from mlx.utils import tree_flatten
 from vocos_mlx import Vocos
+from huggingface_hub import hf_hub_download
 
 class TxtEmbed(nn.Module):
     def __init__(self, dim):
@@ -213,7 +214,7 @@ class Transformer(nn.Module):
         return self.o_proj(x)
 
 class E2TTS(nn.Module):
-    def __init__(self, dim=512, n_head=8, depth=8, stp=32, mxl=400, rnd=(0.7, 1.0)):
+    def __init__(self, dim=512, n_head=8, depth=8, stp=1, mxl=400, rnd=(0.7, 1.0)):
         super().__init__()
         self.mxl = mxl
         self.rnd = rnd
@@ -239,14 +240,14 @@ class E2TTS(nn.Module):
     def sample(self, mel, txt, f_name, len=364):
         mel, mask = transpad(mel, mxl=self.mxl, rnd=None)
         txt = tokenize(txt, max_len=mel.shape[1])
-        batch, seq_len, _ = mel.shape
+        B = mel.shape[0]
         pred_mask = mx.zeros(mask.shape, dtype=mx.bool_)
         pred_mask[:, :len] = True
         cond = einx.where('b n, b n d, b n d -> b n d', mask, mel, mx.zeros_like(mel))
         x = mx.random.normal(mel.shape)
         for i in range(self.stp):
             t = i / self.stp
-            t_batch = mx.full((batch,), t)
+            t_batch = mx.full((B,), t)
             x = x * pred_mask[...,None]
             pred = self.transformer(x, cond, times=t_batch, txt=txt, mask=pred_mask)
             x = x + pred / self.stp
@@ -292,25 +293,35 @@ def log(f_name, *x):
             print(i)
             f.write(f'{i}\n')
 
-def plot_mel_spectrograms(original_mels, generated_mels, f_name='mel_comparison'):
+def plot_mel_spectrograms(input_mels, generated_mels, original_mels, f_name='mel_comparison'):
     for i in range(len(original_mels)):
-        original_mel = original_mels[i]
-        generated_mel = generated_mels[i]
-        original_mel = np.array(original_mel).squeeze()
-        generated_mel = np.array(generated_mel).squeeze()
+        input_mel = np.array(input_mels[i]).squeeze()
+        generated_mel = np.array(generated_mels[i]).squeeze()
+        original_mel = np.array(original_mels[i]).squeeze()
         generated_mel = generated_mel[:,:original_mel.shape[-1]]
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
-        im1 = ax1.imshow(original_mel, aspect='auto', origin='lower', interpolation='nearest')
-        ax1.set_title('Original Mel Spectrogram')
+        max_width = max(input_mel.shape[1], generated_mel.shape[1], original_mel.shape[1])
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 15))
+        im1 = ax1.imshow(input_mel, aspect='auto', origin='lower', interpolation='nearest')
+        ax1.set_title('Input Mel Spectrogram')
         ax1.set_ylabel('Mel Frequency Bin')
+        ax1.set_xlim(0, max_width)
         fig.colorbar(im1, ax=ax1, format='%+2.0f dB')
         im2 = ax2.imshow(generated_mel, aspect='auto', origin='lower', interpolation='nearest')
         ax2.set_title('Generated Mel Spectrogram')
-        ax2.set_xlabel('Time Frame')
         ax2.set_ylabel('Mel Frequency Bin')
+        ax2.set_xlim(0, max_width)
         fig.colorbar(im2, ax=ax2, format='%+2.0f dB')
+        im3 = ax3.imshow(original_mel, aspect='auto', origin='lower', interpolation='nearest')
+        ax3.set_title('Original Mel Spectrogram')
+        ax3.set_xlabel('Time Frame')
+        ax3.set_ylabel('Mel Frequency Bin')
+        ax3.set_xlim(0, max_width)
+        fig.colorbar(im3, ax=ax3, format='%+2.0f dB')
+        for ax in [ax1, ax2, ax3]:
+            ax.set_xticks(np.linspace(0, max_width, 5))
+            ax.set_xticklabels(np.linspace(0, max_width, 5, dtype=int))
         plt.tight_layout()
-        plt.savefig(f'{f_name}_{i}.png')
+        plt.savefig(f'{f_name}_{i}.png', dpi=300, bbox_inches='tight')
         plt.close()
 
 def tokenize(list_str, max_len):
@@ -336,7 +347,7 @@ def sample(model, example, f_name='sample'):
     model.eval()
     mx.eval(model)
     out = model.sample(mel, txt, f_name=f_name)
-    plot_mel_spectrograms(example['mel'], out, f_name=f_name)
+    plot_mel_spectrograms(mel, out, example['mel'], f_name=f_name)
     print(f'Sampled ({time.perf_counter() - tic:.2f} sec)')
 
 def train(model, dataset, batch_size, n_epoch, lr, postfix):
@@ -399,8 +410,25 @@ def train(model, dataset, batch_size, n_epoch, lr, postfix):
                 sample(model=model, example=example, f_name=f_name)
     return f_name
 
+def tts(prompt, model=None, f_name='tts'):
+    if model is None:
+        model = E2TTS()
+        wt = hf_hub_download(repo_id='JosefAlbers/e2tts-mlx', filename='e2tts.safetensors')
+        model.load_weights(wt)
+    if isinstance(prompt, str):
+        prompt = [prompt]
+    mel = np.zeros((len(prompt), 1, 100, 10))
+    tic = time.perf_counter()
+    model.eval()
+    mx.eval(model)
+    out = model.sample(mel, prompt, f_name=f_name, len=257)
+    print(f'TTS ({time.perf_counter() - tic:.2f} sec)')
+    return out
 
-def main(batch_size=32, n_epoch=200, lr=2e-4, depth=8, stp=1, postfix=''):
+def main(prompt=False, batch_size=32, n_epoch=200, lr=2e-4, depth=8, stp=1, postfix=''):
+    if prompt:
+        tts(prompt)
+        return prompt
     model = E2TTS(depth=depth, stp=stp)
     dataset = get_ds()
     f_name = train(model=model, dataset=dataset, batch_size=batch_size, n_epoch=n_epoch, lr=lr, postfix=postfix)
@@ -408,7 +436,11 @@ def main(batch_size=32, n_epoch=200, lr=2e-4, depth=8, stp=1, postfix=''):
     loaded = E2TTS(depth=depth, stp=stp)
     loaded.load_weights(f'{f_name}.safetensors')
     sample(model=loaded, example=dataset.shuffle()[:4], f_name=f'{f_name}_loaded')
+    tts(prompt='We must achieve our own salvation.', model=loaded, f_name=f'{f_name}_tts')
     del loaded
+
+def fire_main():
+    fire.Fire(main)
 
 if __name__ == '__main__':
     fire.Fire(main)

@@ -8,7 +8,7 @@ setup(
     url='https://github.com/JosefAlbers/e2tts-mlx',
     py_modules=['e2tts'],
     packages=find_packages(),
-    version='0.0.1-beta',
+    version='0.0.2',
     readme="README.md",
     author_email="albersj66@gmail.com",
     description="Embarrassingly Easy Fully Non-Autoregressive Zero-Shot TTS in MLX",
@@ -20,7 +20,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "e2tts = e2tts:main",
+            "e2tts = e2tts:fire_main",
         ],
     },
 )
