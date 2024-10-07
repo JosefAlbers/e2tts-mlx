@@ -399,7 +399,8 @@ def train(model, dataset, batch_size, n_epoch, lr, postfix):
                 sample(model=model, example=example, f_name=f_name)
     return f_name
 
-def main(batch_size=1, n_epoch=2000, lr=2e-4, depth=16, stp=1, postfix=''):
+
+def main(batch_size=32, n_epoch=200, lr=2e-4, depth=8, stp=1, postfix=''):
     model = E2TTS(depth=depth, stp=stp)
     dataset = get_ds()
     f_name = train(model=model, dataset=dataset, batch_size=batch_size, n_epoch=n_epoch, lr=lr, postfix=postfix)
