@@ -214,18 +214,22 @@ class Transformer(nn.Module):
         return self.o_proj(x)
 
 class E2TTS(nn.Module):
-    def __init__(self, dim=512, n_head=8, depth=8, stp=1, mxl=400, rnd=(0.7, 1.0)):
+    def __init__(self, durator=None, dim=512, n_head=8, depth=8, n_ode=1, mxl=400, rnd=(0.7, 1.0)):
         super().__init__()
+        if durator is None:
+            self.durator = Durator()
+        else:
+            self.durator = durator
         self.mxl = mxl
         self.rnd = rnd
-        self.stp = stp
+        self.n_ode = n_ode
         self.transformer = Transformer(dim=dim, n_head=n_head, depth=depth)
         self._wav = ToWav()
     def __call__(self, mel, txt):
         x1, mask, rand_mask = transpad(mel, mxl=self.mxl, rnd=self.rnd)
         txt = tokenize(txt, max_len=x1.shape[1])
         x0 = mx.random.normal(x1.shape)
-        times = mx.random.randint(low=0, high=self.stp, shape=x1.shape[:1]) / self.stp
+        times = mx.random.randint(low=0, high=self.n_ode, shape=x1.shape[:1]) / self.n_ode
         t = times[:,None,None]
         flow = x1 - x0
         w = t*x1 + (1-t)*x0
@@ -237,24 +241,144 @@ class E2TTS(nn.Module):
         loss = ((flow - pred)**2) * rand_mask[:,:,None]
         loss = loss.sum() / ntok
         return loss, ntok
-    def sample(self, mel, txt, f_name, len=364):
+    def sample(self, mel, txt, f_name):
         mel, mask = transpad(mel, mxl=self.mxl, rnd=None)
+        pred_mask = self.durator.predict(txt)
         txt = tokenize(txt, max_len=mel.shape[1])
         B = mel.shape[0]
-        pred_mask = mx.zeros(mask.shape, dtype=mx.bool_)
-        pred_mask[:, :len] = True
         cond = einx.where('b n, b n d, b n d -> b n d', mask, mel, mx.zeros_like(mel))
         x = mx.random.normal(mel.shape)
-        for i in range(self.stp):
-            t = i / self.stp
+        for i in range(self.n_ode):
+            t = i / self.n_ode
             t_batch = mx.full((B,), t)
             x = x * pred_mask[...,None]
             pred = self.transformer(x, cond, times=t_batch, txt=txt, mask=pred_mask)
-            x = x + pred / self.stp
+            x = x + pred / self.n_ode
         out = einx.where('b n, b n d, b n d -> b n d', mask, mel, x)
         for i, o in enumerate(out):
             self._wav(o[None], f_name=f'{f_name}_{i}')
         return out.transpose(0, 2, 1)
+
+class DurLayer(nn.Module):
+    def __init__(self, dim_duration, n_head):
+        super().__init__()
+        self.attn = Attention(dim_duration, n_head)
+        self.mlp = MLP(dim_duration)
+        self.norm1 = nn.RMSNorm(dim_duration)
+        self.norm2 = nn.RMSNorm(dim_duration)
+    def __call__(self, x, mask, rope):
+        r = self.attn(self.norm1(x), mask=mask, rope=rope)
+        h = x + r
+        r = self.mlp(self.norm2(h))
+        return h + r
+
+class Durator(nn.Module):
+    def __init__(self, dim_duration=32, n_head=4, dep_duration=2, mxl=400):
+        super().__init__()
+        self.mxl = mxl
+        self.txt_embed = TxtEmbed(dim_duration)
+        self.layers = [DurLayer(dim_duration, n_head) for _ in range(dep_duration)]
+        self.rope = RoPE(dim_duration//n_head)
+        self.o_proj = nn.Linear(dim_duration*mxl, 1)
+    def __call__(self, txt):
+        x, mask = tokenize(txt, max_len=self.mxl, return_mask=True)
+        mask = mx.where(mask[:, :, None]*mask[:, None, :]==1, 0, -mx.inf)
+        mask = mx.expand_dims(mask, 1)
+        x = self.txt_embed(x)
+        B, S, _ = x.shape
+        rope = self.rope(S)
+        for i, l in enumerate(self.layers):
+            x = l(x, mask=mask, rope=rope)
+        x = x.reshape(B,-1)
+        return self.o_proj(x)
+    def predict(self, txt):
+        x = np.array(self.__call__(txt))
+        x = np.round(x.squeeze(-1)).astype(int)
+        mask = np.zeros((x.shape[0], self.mxl), dtype=bool)
+        for i, length in enumerate(x):
+            if length > self.mxl:
+                raise ValueError(f"Predicted length {length} for '{txt[i]}' exceeds maximum length {self.mxl}")
+            if length <= 0:
+                raise ValueError(f"Predicted length {length} for '{txt[i]}' is not positive")
+            print(i, length)
+            mask[i,:length] = True
+        return mx.array(mask)
+
+def durpred(model, example):
+    y_true = [m.shape[-1] for m in example['mel']]
+    y_pred = model(example['text'])
+    y_pred = y_pred.squeeze(-1).astype(mx.int32).tolist()
+    print(f'{y_true=}\n{y_pred=}')
+
+def durtrain(model, dataset, batch_size, n_epoch, lr, postfix):
+    args = {k: v for k, v in sorted(locals().items()) if k not in ['model', 'dataset']}
+    def get_batch(dataset, batch_size):
+        for i in range(0, len(dataset), batch_size):
+            batch = dataset[i:i+batch_size]
+            yield batch['mel'], batch['text']
+    def get_optim():
+        _n_steps = math.ceil(n_epoch * len(dataset) / batch_size)
+        _n_warmup = _n_steps//5
+        _warmup = optim.linear_schedule(1e-6, lr, steps=_n_warmup)
+        _cosine = optim.cosine_decay(lr, _n_steps-_n_warmup, 1e-5)
+        return optim.Lion(learning_rate=optim.join_schedules([_warmup, _cosine], [_n_warmup]))
+    def evaluate(model, dataset, batch_size=32):
+        model.eval()
+        mx.eval(model)
+        sum_loss = 0
+        num_loss = 0
+        for mel, txt in get_batch(dataset, batch_size):
+            loss, ntok = loss_fn(model, mel, txt)
+            sum_loss += loss * ntok
+            num_loss += ntok
+            mx.eval(sum_loss, num_loss)
+        return (sum_loss / num_loss).item()
+    def loss_fn(model, mel, txt):
+        len_true = mx.array([m.shape[-1] for m in mel])
+        len_pred = model(txt).squeeze(-1)
+        ntok = len(txt)
+        loss = ((len_true - len_pred) ** 2).sum() / ntok
+        return loss, ntok
+    f_name = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_durpred_{postfix}'
+    log(f_name, args)
+    example = dataset[:10]
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    optimizer = get_optim()
+    model.train()
+    mx.eval(model, optimizer)
+    state = [model.state, optimizer.state]
+    best_avg_loss = mx.inf
+    best_eval_loss = mx.inf
+    for e in range(n_epoch):
+        dataset = dataset.shuffle()
+        sum_loss = 0
+        num_loss = 0
+        tic = time.perf_counter()
+        for batch in get_batch(dataset, batch_size):
+            model.train()
+            (loss, ntok), grads = loss_and_grad_fn(model, *batch)
+            optimizer.update(model, grads)
+            mx.eval(loss, ntok, state)
+            sum_loss += loss * ntok
+            num_loss += ntok
+        avg_loss = (sum_loss/num_loss).item()
+        log(f_name, f'{avg_loss:.4f} @ {e} in {(time.perf_counter() - tic):.2f}')
+        if e > n_epoch//5 and avg_loss < best_avg_loss:
+            eval_loss = evaluate(model, dataset)
+            log(f_name, f'- {eval_loss:.4f}')
+            if eval_loss < best_eval_loss:
+                log(f_name, '- Saved weights')
+                model.save_weights(f'{f_name}.safetensors')
+                best_eval_loss = eval_loss
+                best_avg_loss = avg_loss
+                # durpred(model=model, example=example)
+    return model
+
+def durmain(batch_size=8, n_epoch=50, lr=1e-3, dep_duration=2, postfix=''):
+    model = Durator(dep_duration=dep_duration)
+    dataset = get_ds()
+    model = durtrain(model=model, dataset=dataset, batch_size=batch_size, n_epoch=n_epoch, lr=lr, postfix=postfix)
+    return model
 
 def transpad(raw, mxl=None, rnd=None):
     raw = [arr.squeeze(0) for arr in raw]
@@ -324,12 +448,16 @@ def plot_mel_spectrograms(input_mels, generated_mels, original_mels, f_name='mel
         plt.savefig(f'{f_name}_{i}.png', dpi=300, bbox_inches='tight')
         plt.close()
 
-def tokenize(list_str, max_len):
+def tokenize(list_str, max_len, return_mask=False):
     arr = [list(bytes(t, 'UTF-8')) for t in list_str]
     padded_arr = np.full((len(arr), max_len), -1, dtype=np.int64)
+    mask = np.zeros((len(arr), max_len), dtype=bool)
     for i, a in enumerate(arr):
         a = a[:max_len]
         padded_arr[i, :len(a)] = a
+        mask[i, :len(a)] = True
+    if return_mask:
+        return mx.array(padded_arr), mx.array(mask)
     return mx.array(padded_arr)
 
 @mx.compile
@@ -421,23 +549,25 @@ def tts(prompt, model=None, f_name='tts'):
     tic = time.perf_counter()
     model.eval()
     mx.eval(model)
-    out = model.sample(mel, prompt, f_name=f_name, len=257)
+    out = model.sample(mel, prompt, f_name=f_name)
     print(f'TTS ({time.perf_counter() - tic:.2f} sec)')
     return out
 
-def main(prompt=False, batch_size=32, n_epoch=200, lr=2e-4, depth=8, stp=1, postfix=''):
+def main(prompt=False, batch_size=32, n_epoch=200, lr=2e-4, depth=8, n_ode=1, postfix=''):
     if prompt:
         tts(prompt)
         return prompt
-    model = E2TTS(depth=depth, stp=stp)
+    durator = durmain()
+    model = E2TTS(durator=durator, depth=depth, n_ode=n_ode)
     dataset = get_ds()
     f_name = train(model=model, dataset=dataset, batch_size=batch_size, n_epoch=n_epoch, lr=lr, postfix=postfix)
     del model
-    loaded = E2TTS(depth=depth, stp=stp)
+    loaded = E2TTS(durator=None, depth=depth, n_ode=n_ode)
     loaded.load_weights(f'{f_name}.safetensors')
     sample(model=loaded, example=dataset.shuffle()[:4], f_name=f'{f_name}_loaded')
     tts(prompt='We must achieve our own salvation.', model=loaded, f_name=f'{f_name}_tts')
     del loaded
+    del durator
 
 def fire_main():
     fire.Fire(main)
