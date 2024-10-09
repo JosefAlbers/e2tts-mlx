@@ -24,6 +24,8 @@ To use a pre-trained model for text-to-speech:
 e2tts 'We must achieve our own salvation.'
 ```
 
+This will write `tts_0.wav` to the current directory, which you can then play.
+
 https://github.com/user-attachments/assets/c022d622-2437-4dbf-b3ac-d0ce89322402
 
 To train a new model with default settings:
