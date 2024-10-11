@@ -7,7 +7,6 @@ A lightweight implementation of [Embarrassingly Easy Fully Non-Autoregressive Ze
 ### Install
 
 ```zsh
-# Quick install (note: PyPI version may not always be up to date)
 pip install e2tts-mlx
 
 # For the latest version, you can install directly from the repository:
@@ -26,7 +25,7 @@ e2tts 'We must achieve our own salvation.'
 
 This will write `tts_0.wav` to the current directory, which you can then play.
 
-https://github.com/user-attachments/assets/c022d622-2437-4dbf-b3ac-d0ce89322402
+https://github.com/user-attachments/assets/89265113-0785-42f1-b867-c38c886acbef
 
 To train a new model with default settings:
 
@@ -39,16 +38,15 @@ e2tts
 To train with custom options:
 
 ```zsh
-e2tts --batch_size=16 --n_epoch=100 --lr=1e-4 --depth=8 --stp=32
+e2tts --batch_size=16 --n_epoch=200 --lr=1e-4 --depth=8 --n_ode=32
 ```
 
-Available training options:
+Select training options:
 - `--batch_size`: Set the batch size (default: 32)
 - `--n_epoch`: Set the number of epochs (default: 200)
 - `--lr`: Set the learning rate (default: 2e-4)
 - `--depth`: Set the model depth (default: 8)
-- `--stp`: Set the number of steps for sampling (default: 1)
-- `--postfix`: Add a custom postfix to output file names
+- `--n_ode`: Set the number of steps for sampling (default: 1)
 
 ## Acknowledgements
 
