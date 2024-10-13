@@ -19,6 +19,8 @@ from huggingface_hub import hf_hub_download
 from mlx.utils import tree_flatten
 from vocos_mlx import Vocos
 
+REPEAT = True # https://arxiv.org/pdf/2410.07041
+
 class TxtEmbed(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -282,18 +284,19 @@ class Durator(nn.Module):
         self.txt_embed = TxtEmbed(cfg['dim_dur'])
         self.layers = [DurLayer(cfg['dim_dur'], cfg['n_head_dur']) for _ in range(cfg['dep_dur'])]
         self.rope = RoPE(cfg['dim_dur']//cfg['n_head_dur'])
-        # self.c_proj = nn.Sequential(nn.RMSNorm(cfg['dim_dur']), nn.Linear(cfg['dim_dur'], 1, bias=False), nn.SiLU())
         self.o_proj = nn.Linear(cfg['dim_dur']*cfg['mxl'], 1)
+
     def __call__(self, txt):
-        x, mask = tokenize(txt, max_len=self.mxl, return_mask=True)
-        mask = mx.where(mask[:, None, :, None]*mask[:, None, None, :]==1, 0, -mx.inf)
+        x, mask_raw = tokenize(txt, max_len=self.mxl, return_mask=True)
+        mask = mx.where(mask_raw[:, None, :, None]*mask_raw[:, None, None, :]==1, 0, -mx.inf)
         x = self.txt_embed(x)
         B, S, _ = x.shape
         rope = self.rope(S)
         for i, l in enumerate(self.layers):
             x = l(x, mask=mask, rope=rope)
-        # return self.c_proj(x).reshape(B, -1).sum(keepdims=True, axis=-1) * self.mxl
+        x = x * mask_raw[...,None]
         return self.o_proj(x.reshape(B,-1)) * self.mxl
+
     def predict(self, txt, return_lens=False):
         x = np.array(self.__call__(txt))
         x = np.round(x.squeeze(-1)).astype(int)
@@ -308,9 +311,30 @@ class Durator(nn.Module):
             return mx.array(mask), x.tolist()
         return mx.array(mask)
 
-def drain(dataset, cfg, batch_size, n_epoch, lr, postfix):
+def get_batch_org(dataset, batch_size):
+    for i in range(0, len(dataset), batch_size):
+        batch = dataset[i:i+batch_size]
+        yield batch['mel'], batch['text']
+
+def get_batch_rep(dataset, batch_size, dataset_to_gen): # [] shuffle
+    rep_size = max(1, int(batch_size * 0.75))
+    gen_size = batch_size - rep_size
+    rep_index = 0
+    rep_length = len(dataset)
+    mel_ds = dataset['mel']
+    txt_ds = dataset['text']
+    for gen_index in range(0, len(dataset_to_gen), gen_size):
+        mel_batch = [mel_ds[(rep_index + i) % rep_length] for i in range(rep_size)]
+        txt_batch = [txt_ds[(rep_index + i) % rep_length] for i in range(rep_size)]
+        gen_batch = dataset_to_gen[gen_index:gen_index + gen_size]
+        if not gen_batch:
+            break
+        rep_index += rep_size
+        yield mel_batch + [i for i in gen_batch['mel']], txt_batch + [i for i in gen_batch['text']]
+
+def drain(dataset, cfg, batch_size, n_epoch, lr, len_dataset, get_batch, postfix):
     f_name = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_drain_{postfix}'
-    args = {k: v for k, v in sorted(locals().items()) if k not in ['dataset', 'model']}
+    args = {k: v for k, v in sorted(locals().items()) if k not in ['dataset', 'get_batch']}
     log(f_name, args)
     def durpred(model, example):
         model.eval()
@@ -319,12 +343,8 @@ def drain(dataset, cfg, batch_size, n_epoch, lr, postfix):
         y_pred = model(example['text'])
         y_pred = y_pred.squeeze(-1).astype(mx.int32).tolist()
         print(f'{y_true=}\n{y_pred=}')
-    def get_batch(dataset, batch_size):
-        for i in range(0, len(dataset), batch_size):
-            batch = dataset[i:i+batch_size]
-            yield batch['mel'], batch['text']
     def get_optim():
-        _n_steps = math.ceil(n_epoch * len(dataset) / batch_size)
+        _n_steps = math.ceil(n_epoch * len_dataset / batch_size)
         _n_warmup = _n_steps//5
         _warmup = optim.linear_schedule(1e-6, lr, steps=_n_warmup)
         _cosine = optim.cosine_decay(lr, _n_steps-_n_warmup, 1e-5)
@@ -405,6 +425,12 @@ def transpad(raw, mxl=None, rnd=None):
     rand_mask = np.zeros((batch_size, mxl), dtype=bool)
     for i in range(batch_size):
         rand_mask[i, start[i]:end[i]] = True
+    rand_truncs = (lens * np.random.uniform(0.9, 1.1, size=batch_size)).astype(int)
+    for i in range(batch_size):
+        rand_trunc = rand_truncs[i]
+        padding_mask[i, :rand_trunc] = True
+        padding_mask[i, rand_trunc:] = False
+    padded_arr *= padding_mask[...,None]
     rand_mask &= padding_mask
     return mx.array(padded_arr), mx.array(padding_mask), mx.array(rand_mask)
 
@@ -481,18 +507,13 @@ def sample(model, example, f_name='sample'):
     plot_mel_spectrograms(mel, out, example['mel'], f_name=f_name)
     print(f'Sampled ({time.perf_counter() - tic:.2f} sec)')
 
-def train(dataset, cfg, batch_size, n_epoch, lr, postfix):
+def train(dataset, cfg, batch_size, n_epoch, lr, len_dataset, get_batch, postfix):
     f_name = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_{postfix}'
-    args = {k: v for k, v in sorted(locals().items()) if k not in ['dataset']}
+    args = {k: v for k, v in sorted(locals().items()) if k not in ['dataset', 'get_batch']}
     with open(f"{f_name}_config.json", "w") as f:
         json.dump(cfg, f, indent=4)
-    log(f_name, args)
-    def get_batch(dataset, batch_size):
-        for i in range(0, len(dataset), batch_size):
-            batch = dataset[i:i+batch_size]
-            yield batch['mel'], batch['text']
     def get_optim():
-        _n_steps = math.ceil(n_epoch * len(dataset) / batch_size)
+        _n_steps = math.ceil(n_epoch * len_dataset / batch_size)
         _n_warmup = _n_steps//5
         _warmup = optim.linear_schedule(1e-6, lr, steps=_n_warmup)
         _cosine = optim.cosine_decay(lr, _n_steps-_n_warmup, 1e-5)
@@ -512,7 +533,8 @@ def train(dataset, cfg, batch_size, n_epoch, lr, postfix):
         return (sum_loss / num_loss).item()
     def loss_fn(model, mel, txt):
         return model(mel, txt)
-    durator = drain(dataset=dataset, cfg=cfg, postfix=postfix, batch_size=1, n_epoch=30, lr=2e-4)
+    durator = drain(dataset=dataset, cfg=cfg, postfix=postfix, batch_size=4, n_epoch=30, lr=2e-4, len_dataset=len_dataset, get_batch=get_batch)
+    log(f_name, args)
     model = E2TTS(cfg=cfg, durator=durator)
     example = dataset[:1]
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
@@ -570,9 +592,17 @@ def main(prompt=False, batch_size=32, n_epoch=100, lr=2e-4, dim=512, n_head=8, d
     if prompt:
         tts(prompt)
         return prompt
+
+    if REPEAT:
+        _dataset_to_gen = get_ds(mxl=mxl, path_ds='JosefAlbers/lj-speech', split='full')
+        get_batch = partial(get_batch_rep, dataset_to_gen=_dataset_to_gen)
+        len_dataset = len(_dataset_to_gen)
+    else:
+        get_batch = get_batch_org
+        len_dataset = None
     dataset = get_ds(mxl=mxl, path_ds=path_ds, split=split)
     cfg = dict(dim=dim, n_head=n_head, depth=depth, n_ode=n_ode, dim_dur=dim_dur, n_head_dur=n_head_dur, dep_dur=dep_dur, mxl=mxl)
-    f_name = train(dataset=dataset, cfg=cfg, postfix=postfix, batch_size=batch_size, n_epoch=n_epoch, lr=lr)
+    f_name = train(dataset=dataset, cfg=cfg, postfix=postfix, batch_size=batch_size, n_epoch=n_epoch, lr=lr, len_dataset=len_dataset, get_batch=get_batch)
     with open(f"{f_name}_config.json", "r") as f:
         cfg_loaded = json.load(f)
     loaded = E2TTS(cfg=cfg_loaded)
