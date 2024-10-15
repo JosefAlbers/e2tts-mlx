@@ -7,6 +7,7 @@ A lightweight implementation of [Embarrassingly Easy Fully Non-Autoregressive Ze
 ### Install
 
 ```zsh
+# Quick install (note: PyPI version may not always be up to date)
 pip install e2tts-mlx
 
 # For the latest version, you can install directly from the repository:
@@ -15,7 +16,7 @@ pip install e2tts-mlx
 # pip install -e .
 ```
 
-## Usage
+### Usage
 
 To use a pre-trained model for text-to-speech:
 
@@ -38,19 +39,21 @@ e2tts
 To train with custom options:
 
 ```zsh
-e2tts --batch_size=16 --n_epoch=200 --lr=1e-4 --depth=8 --n_ode=32
+e2tts --batch_size=16 --n_epoch=100 --lr=1e-4 --depth=8 --n_ode=32
 ```
 
 Select training options:
+
 - `--batch_size`: Set the batch size (default: 32)
-- `--n_epoch`: Set the number of epochs (default: 200)
+- `--n_epoch`: Set the number of epochs (default: 10)
 - `--lr`: Set the learning rate (default: 2e-4)
 - `--depth`: Set the model depth (default: 8)
 - `--n_ode`: Set the number of steps for sampling (default: 1)
+- `--more_ds` parameter: Implements [two-set training](https://arxiv.org/pdf/2410.07041) (default: 'JosefAlbers/lj-speech')
 
 ## Acknowledgements
 
-Thanks to [lucidrains](https://github.com/lucidrains/e2-tts-pytorch)' fantastic code that inspired this project.
+Special thanks to [lucidrains](https://github.com/lucidrains/e2-tts-pytorch)' fantastic code that inspired this project, and to [lucasnewman](https://github.com/lucasnewman/vocos-mlx)'s the Vocos implementation that made this possible.
 
 ## License
 

@@ -13,13 +13,11 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 import soundfile as sf
-from datasets import Audio, load_dataset
+from datasets import Audio, load_dataset, concatenate_datasets
 from einops.array_api import pack, rearrange, repeat, unpack
 from huggingface_hub import hf_hub_download
 from mlx.utils import tree_flatten
 from vocos_mlx import Vocos
-
-REPEAT = True # https://arxiv.org/pdf/2410.07041
 
 class TxtEmbed(nn.Module):
     def __init__(self, dim):
@@ -151,7 +149,7 @@ class TxtLayer(nn.Module):
         self.norm2 = nn.RMSNorm(dim_txt)
         self.cross = Cross(dim_mel = dim_mel, dim_txt = dim_txt, cond_audio_to_text = isnt_last)
     def __call__(self, x, txt, mask, rope):
-        txt = txt + self.attn(self.norm1(txt), mask=mask, rope=rope) # [] mask=0
+        txt = txt + self.attn(self.norm1(txt), mask=mask, rope=rope)
         txt = txt + self.mlp(self.norm2(txt))
         x, txt = self.cross(x, txt)
         return x, txt
@@ -190,7 +188,7 @@ class MultiStream(nn.Module):
         times = self.time_cond_mlp(times)
         skips = []
         for i in range(self.depth):
-            x, txt = self.txt_layers[i](x=x, txt=txt, mask=mask, rope=rope_txt)
+            x, txt = self.txt_layers[i](x=x, txt=txt, mask=0, rope=rope_txt) #
             if i < self.depth//2:
                 skips.append(x)
             else:
@@ -285,7 +283,6 @@ class Durator(nn.Module):
         self.layers = [DurLayer(cfg['dim_dur'], cfg['n_head_dur']) for _ in range(cfg['dep_dur'])]
         self.rope = RoPE(cfg['dim_dur']//cfg['n_head_dur'])
         self.o_proj = nn.Linear(cfg['dim_dur']*cfg['mxl'], 1)
-
     def __call__(self, txt):
         x, mask_raw = tokenize(txt, max_len=self.mxl, return_mask=True)
         mask = mx.where(mask_raw[:, None, :, None]*mask_raw[:, None, None, :]==1, 0, -mx.inf)
@@ -296,7 +293,6 @@ class Durator(nn.Module):
             x = l(x, mask=mask, rope=rope)
         x = x * mask_raw[...,None]
         return self.o_proj(x.reshape(B,-1)) * self.mxl
-
     def predict(self, txt, return_lens=False):
         x = np.array(self.__call__(txt))
         x = np.round(x.squeeze(-1)).astype(int)
@@ -311,26 +307,153 @@ class Durator(nn.Module):
             return mx.array(mask), x.tolist()
         return mx.array(mask)
 
+class E2ASR(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.mxl = cfg['mxl']
+        self.i_proj = nn.Linear(cfg['n_chan'], cfg['dim'])
+        self.layers = [DurLayer(cfg['dim'], cfg['n_head']) for _ in range(cfg['depth'])]
+        self.rope = RoPE(cfg['dim']//cfg['n_head'])
+        self.o_proj = nn.Linear(cfg['dim'], 257)
+    def __call__(self, mel, txt=None):
+        mel, mask = transpad(mel, mxl=self.mxl, rnd=None)
+        mask = mx.where(mask[:, None, :, None]*mask[:, None, None, :]==1, 0, -mx.inf)
+        mel = self.i_proj(mel)
+        rope = self.rope(mel.shape[1])
+        for i, l in enumerate(self.layers):
+            mel = l(mel, mask=mask, rope=rope)
+        logits = self.o_proj(mel)
+        if txt is None:
+            txt_pred = mx.argmax(logits, axis=-1).astype(mx.int32)
+            txt_pred -= 1
+            txt_pred = [row[:np.where(row < 0)[0][0]].tolist() if np.any(row < 0) else row.tolist() for row in np.array(txt_pred)]
+            txt_pred = [''.join(chr(b) for b in t) for t in txt_pred]
+            print(txt_pred)
+            return txt_pred
+        txt_target, txt_mask = tokenize(txt, max_len=self.mxl, return_mask=True)
+        txt_target += 1
+        txt_mask = mx.pad(txt_mask, ((0,0), (1, 0)), constant_values=True)[:,:-1]
+        ntok = txt_mask.sum()
+        loss = nn.losses.cross_entropy(logits, txt_target, reduction='none') * txt_mask
+        loss = loss.sum() / ntok
+        return loss, ntok
+
+def train_asr(dataset, cfg, batch_size, n_epoch, lr, len_dataset, get_batch, postfix):
+    f_name = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_asr_{postfix}'
+    args = {k: v for k, v in sorted(locals().items()) if k not in ['dataset', 'get_batch']}
+    with open(f"{f_name}_config.json", "w") as f:
+        json.dump(cfg, f, indent=4)
+    def get_optim():
+        _n_steps = math.ceil(n_epoch * len_dataset / batch_size)
+        _n_warmup = _n_steps//5
+        _warmup = optim.linear_schedule(1e-6, lr, steps=_n_warmup)
+        _cosine = optim.cosine_decay(lr, _n_steps-_n_warmup, 1e-5)
+        return optim.AdamW(learning_rate=optim.join_schedules([_warmup, _cosine], [_n_warmup]))
+    def evaluate(model, dataset, batch_size=128):
+        model.eval()
+        mx.eval(model)
+        sum_loss = 0
+        num_loss = 0
+        for mel, txt in get_batch(dataset, batch_size):
+            loss, ntok = model(mel, txt)
+            sum_loss += loss * ntok
+            num_loss += ntok
+            mx.eval(sum_loss, num_loss)
+        model(mel=dataset[-3:]['mel'])
+        model.train()
+        mx.eval(model)
+        return (sum_loss / num_loss).item()
+    def loss_fn(model, mel, txt):
+        return model(mel, txt)
+    log(f_name, args)
+    model = E2ASR(cfg=cfg)
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    optimizer = get_optim()
+    model.train()
+    mx.eval(model, optimizer)
+    state = [model.state, optimizer.state]
+    best_avg_loss = mx.inf
+    best_eval_loss = mx.inf
+    for e in range(n_epoch):
+        sum_loss = 0
+        num_loss = 0
+        tic = time.perf_counter()
+        for batch in get_batch(dataset, batch_size):
+            (loss, ntok), grads = loss_and_grad_fn(model, *batch)
+            optimizer.update(model, grads)
+            mx.eval(loss, ntok, state)
+            sum_loss += loss * ntok
+            num_loss += ntok
+        avg_loss = (sum_loss/num_loss).item()
+        log(f_name, f'{avg_loss:.4f} @ {e} in {(time.perf_counter() - tic):.2f}')
+        if e >= n_epoch//5-1 and avg_loss < best_avg_loss:
+            eval_loss = evaluate(model, dataset)
+            log(f_name, f'- {eval_loss:.4f}')
+            if eval_loss < best_eval_loss:
+                log(f_name, '- Saved weights')
+                model.save_weights(f'{f_name}.safetensors')
+                best_eval_loss = eval_loss
+                best_avg_loss = avg_loss
+    del model
+    return f_name
+
+def side(batch_size=32, n_epoch=20, lr=2e-4, dim=512, n_head=8, depth=8, mxl=1025, path_ds='JosefAlbers/cmu-arctic', split='aew', more_ds=None, postfix=''):
+    dataset = get_ds(mxl=mxl, path_ds=path_ds, split=split)
+    if more_ds is None:
+        get_batch = get_batch_org
+        len_dataset = len(dataset)
+    else:
+        if isinstance(more_ds, str):
+            _more_ds = get_ds(mxl=mxl, path_ds=more_ds, split=None)
+        else:
+            _more_ds = [get_ds(mxl=mxl, path_ds=i, split=None) for i in more_ds]
+        get_batch = partial(get_batch_rep, more_ds=_more_ds)
+        len_dataset = len(_more_ds)
+    cfg = dict(dim=dim, n_head=n_head, depth=depth, mxl=mxl, n_chan=100)
+    f_name = train_asr(dataset=dataset, cfg=cfg, postfix=postfix, batch_size=batch_size, n_epoch=n_epoch, lr=lr, len_dataset=len_dataset, get_batch=get_batch)
+    with open(f"{f_name}_config.json", "r") as f:
+        cfg_loaded = json.load(f)
+    loaded = E2ASR(cfg=cfg_loaded)
+    loaded.load_weights(f'{f_name}.safetensors')
+    loaded.eval()
+    mx.eval(loaded)
+    example = dataset[-5:]
+    loaded(mel=example['mel'])
+    del loaded
+
 def get_batch_org(dataset, batch_size):
+    dataset = dataset.shuffle()
     for i in range(0, len(dataset), batch_size):
         batch = dataset[i:i+batch_size]
         yield batch['mel'], batch['text']
 
-def get_batch_rep(dataset, batch_size, dataset_to_gen): # [] shuffle
-    rep_size = max(1, int(batch_size * 0.75))
+def get_batch_rep(dataset, batch_size, more_ds):
+    rep_size = int(batch_size * 0.75)
     gen_size = batch_size - rep_size
-    rep_index = 0
-    rep_length = len(dataset)
-    mel_ds = dataset['mel']
-    txt_ds = dataset['text']
-    for gen_index in range(0, len(dataset_to_gen), gen_size):
-        mel_batch = [mel_ds[(rep_index + i) % rep_length] for i in range(rep_size)]
-        txt_batch = [txt_ds[(rep_index + i) % rep_length] for i in range(rep_size)]
-        gen_batch = dataset_to_gen[gen_index:gen_index + gen_size]
-        if not gen_batch:
-            break
-        rep_index += rep_size
-        yield mel_batch + [i for i in gen_batch['mel']], txt_batch + [i for i in gen_batch['text']]
+    rep_iter = iter(dataset.shuffle())
+    gen_iter = iter(more_ds.shuffle())
+    while True:
+        batch_mel = []
+        batch_txt = []
+        for _ in range(rep_size):
+            try:
+                item = next(rep_iter)
+                batch_mel.append(item['mel'])
+                batch_txt.append(item['text'])
+            except StopIteration:
+                rep_iter = iter(dataset.shuffle())
+                item = next(rep_iter)
+                batch_mel.append(item['mel'])
+                batch_txt.append(item['text'])
+        for _ in range(gen_size):
+            try:
+                item = next(gen_iter)
+                batch_mel.append(item['mel'])
+                batch_txt.append(item['text'])
+            except StopIteration:
+                yield batch_mel, batch_txt
+                return
+        yield batch_mel, batch_txt
 
 def drain(dataset, cfg, batch_size, n_epoch, lr, len_dataset, get_batch, postfix):
     f_name = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_drain_{postfix}'
@@ -378,7 +501,6 @@ def drain(dataset, cfg, batch_size, n_epoch, lr, len_dataset, get_batch, postfix
     best_avg_loss = mx.inf
     best_eval_loss = mx.inf
     for e in range(n_epoch):
-        dataset = dataset.shuffle()
         sum_loss = 0
         num_loss = 0
         tic = time.perf_counter()
@@ -435,10 +557,11 @@ def transpad(raw, mxl=None, rnd=None):
     return mx.array(padded_arr), mx.array(padding_mask), mx.array(rand_mask)
 
 def get_ds(mxl, path_ds, split):
-    ds = load_dataset(path_ds, split=split).with_format('numpy')
-    ds = ds.select_columns(['text', 'mel'])
-    ds = ds.filter(lambda x: x['mel'].shape[-1] <= mxl)
-    return ds
+    if split is None:
+        ds = concatenate_datasets([i for i in load_dataset(path_ds).values()])
+    else:
+        ds = load_dataset(path_ds, split=split)
+    return ds.with_format('numpy').select_columns(['text', 'mel']).filter(lambda x: x['mel'].shape[-1] <= mxl)
 
 def log(f_name, *x):
     with open(f'{f_name}.log', 'a') as f:
@@ -545,7 +668,6 @@ def train(dataset, cfg, batch_size, n_epoch, lr, len_dataset, get_batch, postfix
     best_avg_loss = mx.inf
     best_eval_loss = mx.inf
     for e in range(n_epoch):
-        dataset = dataset.shuffle()
         sum_loss = 0
         num_loss = 0
         tic = time.perf_counter()
@@ -571,7 +693,7 @@ def train(dataset, cfg, batch_size, n_epoch, lr, len_dataset, get_batch, postfix
 
 def tts(prompt, model=None, f_name='tts'):
     if model is None:
-        path_model = 'cmu_aew_100'
+        path_model = 'mix_30'
         path_cfg = hf_hub_download(repo_id='JosefAlbers/e2tts-mlx', filename=f'{path_model}.json')
         path_wts = hf_hub_download(repo_id='JosefAlbers/e2tts-mlx', filename=f'{path_model}.safetensors')
         with open(path_cfg, "r") as f:
@@ -580,7 +702,7 @@ def tts(prompt, model=None, f_name='tts'):
         model.load_weights(path_wts)
     if isinstance(prompt, str):
         prompt = [prompt]
-    mel = np.zeros((len(prompt), 1, 100, 10))
+    mel = np.zeros((len(prompt), 1, 100, 1))
     tic = time.perf_counter()
     model.eval()
     mx.eval(model)
@@ -588,19 +710,21 @@ def tts(prompt, model=None, f_name='tts'):
     print(f'TTS ({time.perf_counter() - tic:.2f} sec)')
     return out
 
-def main(prompt=False, batch_size=32, n_epoch=100, lr=2e-4, dim=512, n_head=8, depth=8, n_ode=1, dim_dur=32, n_head_dur=1, dep_dur=2, mxl=1025, path_ds='JosefAlbers/cmu-arctic', split='aew', postfix=''):
+def main(prompt=False, batch_size=32, n_epoch=5, lr=2e-4, dim=512, n_head=8, depth=8, n_ode=1, dim_dur=32, n_head_dur=1, dep_dur=2, mxl=1025, path_ds='JosefAlbers/cmu-arctic', split='aew', more_ds='JosefAlbers/lj-speech', postfix=''):
     if prompt:
         tts(prompt)
         return prompt
-
-    if REPEAT:
-        _dataset_to_gen = get_ds(mxl=mxl, path_ds='JosefAlbers/lj-speech', split='full')
-        get_batch = partial(get_batch_rep, dataset_to_gen=_dataset_to_gen)
-        len_dataset = len(_dataset_to_gen)
-    else:
-        get_batch = get_batch_org
-        len_dataset = None
     dataset = get_ds(mxl=mxl, path_ds=path_ds, split=split)
+    if more_ds is None:
+        get_batch = get_batch_org
+        len_dataset = len(dataset)
+    else:
+        if isinstance(more_ds, str):
+            _more_ds = get_ds(mxl=mxl, path_ds=more_ds, split=None)
+        else:
+            _more_ds = [get_ds(mxl=mxl, path_ds=i, split=None) for i in more_ds]
+        get_batch = partial(get_batch_rep, more_ds=_more_ds)
+        len_dataset = len(_more_ds)
     cfg = dict(dim=dim, n_head=n_head, depth=depth, n_ode=n_ode, dim_dur=dim_dur, n_head_dur=n_head_dur, dep_dur=dep_dur, mxl=mxl)
     f_name = train(dataset=dataset, cfg=cfg, postfix=postfix, batch_size=batch_size, n_epoch=n_epoch, lr=lr, len_dataset=len_dataset, get_batch=get_batch)
     with open(f"{f_name}_config.json", "r") as f:
